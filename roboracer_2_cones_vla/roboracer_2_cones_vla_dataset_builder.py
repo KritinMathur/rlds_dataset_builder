@@ -7,7 +7,7 @@ import tensorflow_datasets as tfds
 import tensorflow_hub as hub
 
 
-class ExampleDataset(tfds.core.GeneratorBasedBuilder):
+class Roboracer2ConesVla(tfds.core.GeneratorBasedBuilder):
     """DatasetBuilder for example dataset."""
 
     VERSION = tfds.core.Version('1.0.0')
@@ -26,29 +26,27 @@ class ExampleDataset(tfds.core.GeneratorBasedBuilder):
                 'steps': tfds.features.Dataset({
                     'observation': tfds.features.FeaturesDict({
                         'image': tfds.features.Image(
-                            shape=(64, 64, 3),
+                            shape=(360, 640, 3),
                             dtype=np.uint8,
                             encoding_format='png',
-                            doc='Main camera RGB observation.',
+                            doc='onboard camera RGB observation',
                         ),
-                        'wrist_image': tfds.features.Image(
-                            shape=(64, 64, 3),
-                            dtype=np.uint8,
+                        'depth_image': tfds.features.Image(
+                            shape=(360, 640, 1),
+                            dtype=np.float32,
                             encoding_format='png',
-                            doc='Wrist camera RGB observation.',
+                            doc='onboard camera depth observation.',
                         ),
                         'state': tfds.features.Tensor(
-                            shape=(10,),
+                            shape=(7,),
                             dtype=np.float32,
-                            doc='Robot state, consists of [7x robot joint angles, '
-                                '2x gripper position, 1x door opening angle].',
+                            doc='Robot state, consists of [3x position, 4x quaternion].',
                         )
                     }),
                     'action': tfds.features.Tensor(
-                        shape=(10,),
+                        shape=(2,),
                         dtype=np.float32,
-                        doc='Robot action, consists of [7x joint velocities, '
-                            '2x gripper velocities, 1x terminate episode].',
+                        doc='Robot action, consists of Vx and steering angle.',
                     ),
                     'discount': tfds.features.Scalar(
                         dtype=np.float32,
@@ -90,56 +88,53 @@ class ExampleDataset(tfds.core.GeneratorBasedBuilder):
     def _split_generators(self, dl_manager: tfds.download.DownloadManager):
         """Define data splits."""
         return {
-            'train': self._generate_examples(path='data/train/episode_*.npy'),
-            'val': self._generate_examples(path='data/val/episode_*.npy'),
+            'train': self._generate_examples(path='data/train/episode*.npz')
         }
 
     def _generate_examples(self, path) -> Iterator[Tuple[str, Any]]:
         """Generator of examples for each split."""
 
-        def _parse_example(episode_path):
-            # load raw data --> this should change for your dataset
-            data = np.load(episode_path, allow_pickle=True)     # this is a list of dicts in our case
+        for episode_path in glob.glob(path):
+            # Load all arrays from .npz
+            data = np.load(episode_path)
+            timestamps = data['timestamps']          # (n,)
+            positions = data['positions']            # (n,3)
+            orientations = data['orientations']       # (n,4)
+            rgb_images = data['rgb_images']          # (n,360,640,3)
+            depth_images = data['depth_images']      # (n,360,640)
+            actions = data['actions']                 # (n,2)
 
-            # assemble episode --> here we're assuming demos so we set reward to 1 at the end
+            n_steps = timestamps.shape[0]
+            instruction = 'Drive the car through the gap between the two cones directly ahead, staying centered in the opening and holding a steady speed.'
+            instruction_embedding = self._embed([instruction])[0].numpy()
+
             episode = []
-            for i, step in enumerate(data):
-                # compute Kona language embedding
-                language_embedding = self._embed([step['language_instruction']])[0].numpy()
-
+            for i in range(n_steps):
+                # Combine position + orientation into state vector
+                state = np.concatenate([positions[i], orientations[i]], axis=0)
                 episode.append({
                     'observation': {
-                        'image': step['image'],
-                        'wrist_image': step['wrist_image'],
-                        'state': step['state'],
+                        'image':rgb_images[i],
+                        'depth_image': depth_images[i].reshape(360, 640, 1),
+                        'state': state,
                     },
-                    'action': step['action'],
+                    'action': actions[i],
                     'discount': 1.0,
-                    'reward': float(i == (len(data) - 1)),
+                    'reward': float(i == n_steps - 1),
                     'is_first': i == 0,
-                    'is_last': i == (len(data) - 1),
-                    'is_terminal': i == (len(data) - 1),
-                    'language_instruction': step['language_instruction'],
-                    'language_embedding': language_embedding,
+                    'is_last': i == n_steps - 1,
+                    'is_terminal': i == n_steps - 1,
+                    'language_instruction': instruction,
+                    'language_embedding': instruction_embedding,
                 })
 
-            # create output data sample
+            # Assemble the final sample
             sample = {
                 'steps': episode,
-                'episode_metadata': {
-                    'file_path': episode_path
-                }
+                'episode_metadata': {'file_path': episode_path},
             }
+            yield episode_path, sample
 
-            # if you want to skip an example for whatever reason, simply return None
-            return episode_path, sample
-
-        # create list of all examples
-        episode_paths = glob.glob(path)
-
-        # for smallish datasets, use single-thread parsing
-        for sample in episode_paths:
-            yield _parse_example(sample)
 
         # for large datasets use beam to parallelize data parsing (this will have initialization overhead)
         # beam = tfds.core.lazy_imports.apache_beam
